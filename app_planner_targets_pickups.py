@@ -1,213 +1,227 @@
 import streamlit as st
 import pandas as pd
-import re, math
+import re
+import math
 
-st.set_page_config(page_title="Travian Artefact Planner", layout="wide")
-
-VALID_TYPES = ["small","large","unique"]
-MAP_SIZE = 401
+st.set_page_config(page_title="Travian Artifact Planner", layout="wide")
 
 # -----------------------------
 # Init session state
 # -----------------------------
-if "OFFS" not in st.session_state:
-    st.session_state.OFFS = pd.DataFrame(columns=["Name","X","Y","Speed","TS","Type"])
-if "CATTAS" not in st.session_state:
-    st.session_state.CATTAS = pd.DataFrame(columns=["Name","X","Y","Speed","TS","Count","UsesLeft"])
-if "PICKUPS" not in st.session_state:
-    st.session_state.PICKUPS = pd.DataFrame(columns=["Name","X","Y","Speed","TS","Treasury"])
-if "TARGETS" not in st.session_state:
-    st.session_state.TARGETS = pd.DataFrame(columns=["Name","Type","X","Y","Treasury"])
+for key in ["OFFS", "CATTAS", "PICKUPS", "TARGETS", "PLANS"]:
+    if key not in st.session_state:
+        st.session_state[key] = pd.DataFrame()
 
 # -----------------------------
-# Helpers
+# Artifact parsers
 # -----------------------------
-def wrap_distance(x1, y1, x2, y2, map_size=401):
-    def d(a,b): return min(abs(a-b), map_size-abs(a-b))
-    return math.hypot(d(x1,x2), d(y1,y2))
+def parse_small_artifacts(html: str):
+    section = re.split(r"Große Artefakte", html)[0]
+    rows = []
+    for line in section.splitlines():
+        if "\t" in line:
+            parts = line.split("\t")
+            if len(parts) >= 3:
+                name = parts[0].strip()
+                player = parts[1].strip()
+                alliance = parts[2].strip()
+                distance = None
+                m = re.search(r"\d+$", line)
+                if m: distance = int(m.group(0))
+                rows.append({
+                    "Name": name,
+                    "Player": player,
+                    "Alliance": alliance,
+                    "Distance": distance,
+                    "Type": "small",
+                    "Delete": False
+                })
+    return pd.DataFrame(rows)
 
-def travel_time(distance, speed, ts_level):
-    if distance <= 20: return distance/speed
-    first = 20/speed
-    rest_speed = speed*(1+0.2*ts_level)
-    rest = (distance-20)/rest_speed
-    return first+rest
-
-def fmt_hms(h):
-    if h==float("inf"): return "-"
-    tot = int(round(h*3600))
-    H = tot//3600; M=(tot%3600)//60; S=tot%60
-    return f"{H:02d}:{M:02d}:{S:02d}"
-
-# -----------------------------
-# Parse artefact overview text
-# -----------------------------
-COORD_RE = re.compile(r"\((-?\d+)\|(-?\d+)\)")
-def parse_overview(text):
-    rows=[]
-    lines=[l.strip() for l in text.split("\n") if l.strip()]
-    for i,line in enumerate(lines):
-        if "Schatzkammer" in line or "treasure" in line.lower():
-            name=lines[i-1]
-            tre=None
-            m=re.search(r"(\d+)", line)
-            if m: tre=int(m.group(1))
-            m2=COORD_RE.search("\n".join(lines[i:i+30]))
-            x=y=None
-            if m2: x=int(m2.group(1)); y=int(m2.group(2))
-            arti_type="small"
-            n=name.lower()
-            if "unique" in n: arti_type="unique"
-            elif "groß" in n or "gross" in n or "large" in n or "plan" in n: arti_type="large"
-            rows.append(dict(Name=name,Type=arti_type,X=x,Y=y,Treasury=tre))
+def parse_large_artifacts(html: str):
+    if "Große Artefakte" not in html:
+        return pd.DataFrame()
+    section = re.split(r"Große Artefakte", html)[1]
+    rows = []
+    for line in section.splitlines():
+        if "\t" in line:
+            parts = line.split("\t")
+            if len(parts) >= 3:
+                name = parts[0].strip()
+                player = parts[1].strip()
+                alliance = parts[2].strip()
+                distance = None
+                m = re.search(r"\d+$", line)
+                if m: distance = int(m.group(0))
+                rows.append({
+                    "Name": name,
+                    "Player": player,
+                    "Alliance": alliance,
+                    "Distance": distance,
+                    "Type": "large",
+                    "Delete": False
+                })
     return pd.DataFrame(rows)
 
 # -----------------------------
-# Priority logic
+# Helper: Calculate travel time
 # -----------------------------
-def arti_priority(name, typ):
-    n=(name or "").lower()
-    if typ=="unique": return 1
-    if "trainer" in n or "ausbilder" in n: return 2
-    if "diet" in n or "getreide" in n: return 3
-    if "boots" in n or "stiefel" in n: return 4
-    if "eyes" in n or "auge" in n or "scout" in n: return 5
-    if "plan" in n or "lager" in n or "granary" in n: return 6
-    return 7
+def travel_time(x1, y1, x2, y2, speed, ts_level=0):
+    dist = math.sqrt((x1 - x2)*2 + (y1 - y2)*2)
+    bonus = 1 + (ts_level * 0.1)  # TS Bonus ~10% per level
+    effective_speed = speed * bonus
+    return dist / effective_speed if effective_speed > 0 else 9999
 
 # -----------------------------
-# Planner
+# Planner Logic
 # -----------------------------
-def plan_targets(targets, offs, cattas, pickups):
-    offs = offs.copy()
-    offs["_used"] = False
-    cattas = cattas.copy()
-    if "UsesLeft" not in cattas.columns: cattas["UsesLeft"] = 2
-    pickups = pickups.copy()
-    pickups["_used"] = False
+def create_plan():
+    offs = st.session_state.OFFS.copy()
+    cattas = st.session_state.CATTAS.copy()
+    pickups = st.session_state.PICKUPS.copy()
+    targets = st.session_state.TARGETS.copy()
 
-    targets = targets.copy()
-    targets["priority"] = targets.apply(lambda r: arti_priority(r["Name"], r["Type"]), axis=1)
-    targets = targets.sort_values("priority").reset_index(drop=True)
+    offs["used"] = False
+    cattas["used"] = 0
+    pickups["used"] = False
 
-    planned = []
-    unplanned = []
+    plans = []
+
+    # Priority: unique > large > small
+    type_order = {"unique": 0, "large": 1, "small": 2}
+    targets = targets.sort_values(by="Type", key=lambda col: col.map(type_order))
 
     for _, t in targets.iterrows():
-        tx, ty = t["X"], t["Y"]
+        best = None
+        for oi, o in offs[~offs["used"]].iterrows():
+            for ci, c in cattas[cattas["used"] < 2].iterrows():
+                for pi, p in pickups[~pickups["used"]].iterrows():
+                    off_time = travel_time(o.X, o.Y, t.Distance, 0, o.Speed, o.TS)
+                    cata_time = travel_time(c.X, c.Y, t.Distance, 0, c.Speed, c.TS)
+                    pickup_time = travel_time(p.X, p.Y, t.Distance, 0, p.Speed, p.TS)
+                    longest = max(off_time, cata_time, pickup_time)
 
-        # check type validity
-        if t["Type"] not in VALID_TYPES:
-            unplanned.append({"Artefact":t["Name"],"Reason":f"Invalid type {t['Type']}"})
-            continue
+                    if (best is None) or (longest < best["Time"]):
+                        best = {
+                            "Target": t["Name"],
+                            "Type": t["Type"],
+                            "Off": o["Name"],
+                            "Catta": c["Name"],
+                            "Pickup": p["Name"],
+                            "Time": longest,
+                            "off_i": oi,
+                            "c_i": ci,
+                            "p_i": pi
+                        }
 
-        # find OFF
-        best_off = None; best_off_time=float("inf")
-        for i,o in offs.iterrows():
-            if o["_used"]: continue
-            if str(o["Type"]).lower() not in VALID_TYPES: continue
-            dist=wrap_distance(o["X"],o["Y"],tx,ty,MAP_SIZE)
-            ttime=travel_time(dist,o["Speed"],o["TS"])
-            if ttime<best_off_time:
-                best_off_time=ttime; best_off=(i,o)
-        if best_off is None:
-            unplanned.append({"Artefact":t["Name"],"Reason":"No free OFF"})
-            continue
+        if best:
+            plans.append(best)
+            offs.at[best["off_i"], "used"] = True
+            cattas.at[best["c_i"], "used"] += 1
+            pickups.at[best["p_i"], "used"] = True
 
-        # find CATTAS
-        best_catta = None; best_catta_time=float("inf")
-        for i,c in cattas.iterrows():
-            if c["UsesLeft"]<=0: continue
-            dist=wrap_distance(c["X"],c["Y"],tx,ty,MAP_SIZE)
-            ttime=travel_time(dist,c["Speed"],c["TS"])
-            if ttime<best_catta_time:
-                best_catta_time=ttime; best_catta=(i,c)
-        if best_catta is None:
-            unplanned.append({"Artefact":t["Name"],"Reason":"No free CATTAS"})
-            continue
+    st.session_state.PLANS = pd.DataFrame(plans)
 
-        # find PICKUP
-        best_pick = None; best_pick_time=float("inf")
-        for i,p in pickups.iterrows():
-            if p["_used"]: continue
-            dist=wrap_distance(p["X"],p["Y"],tx,ty,MAP_SIZE)
-            ttime=travel_time(dist,p["Speed"],p["TS"])
-            if ttime<best_pick_time:
-                best_pick_time=ttime; best_pick=(i,p)
-        if best_pick is None:
-            unplanned.append({"Artefact":t["Name"],"Reason":"No free Pickup"})
-            continue
+# -----------------------------
+# Utility: editor with delete option
+# -----------------------------
+def editable_table(name, columns):
+    if st.session_state[name].empty:
+        st.session_state[name] = pd.DataFrame(columns=columns + ["Delete"])
 
-        # reserve
-        offs.at[best_off[0],"_used"]=True
-        cattas.at[best_catta[0],"UsesLeft"] -=1
-        pickups.at[best_pick[0],"_used"]=True
+    if "Delete" not in st.session_state[name].columns:
+        st.session_state[name]["Delete"] = False
 
-        # record
-        planned.append({
-            "Artefact":t["Name"],
-            "Type":t["Type"],
-            "Off":best_off[1]["Name"], "Off ETA":fmt_hms(best_off_time),
-            "Cattas":best_catta[1]["Name"], "Catta ETA":fmt_hms(best_catta_time),
-            "Pickup":best_pick[1]["Name"], "Pickup ETA":fmt_hms(best_pick_time),
-            "Arrival":fmt_hms(max(best_off_time,best_catta_time,best_pick_time))
-        })
-    return pd.DataFrame(planned), pd.DataFrame(unplanned)
+    st.session_state[name] = st.data_editor(
+        st.session_state[name],
+        num_rows="dynamic",
+        use_container_width=True
+    )
+
+    col1, col2 = st.columns(2)
+    with col1:
+        if st.button(f"Delete selected {name}"):
+            st.session_state[name] = st.session_state[name][~st.session_state[name]["Delete"]].drop(columns=["Delete"])
+    with col2:
+        if st.button(f"Clear all {name}"):
+            st.session_state[name] = pd.DataFrame(columns=columns + ["Delete"])
+
+    st.write(st.session_state[name])
 
 # -----------------------------
 # Tabs
 # -----------------------------
-tab1, tab2, tab3, tab4, tab5 = st.tabs(["Offs","Cattas","Pickups","Targets","Planner"])
+tab1, tab2, tab3, tab4, tab5 = st.tabs([
+    "⚔️ Offs", "🏹 Cattas", "🏛 Pickups", "🎯 Targets", "📑 Planner"
+])
 
+# -----------------------------
+# OFFS Tab
+# -----------------------------
 with tab1:
     st.subheader("⚔️ Manage Offs")
-    file = st.file_uploader("Upload Offs Excel", type=["xlsx"], key="offs_up")
-    if file:
-        st.session_state.OFFS = pd.read_excel(file)
-    st.session_state.OFFS = st.data_editor(st.session_state.OFFS, num_rows="dynamic")
+    uploaded = st.file_uploader("Upload Offs (Excel)", type=["xlsx"])
+    if uploaded:
+        st.session_state.OFFS = pd.read_excel(uploaded)
+    editable_table("OFFS", ["Name", "X", "Y", "Speed", "TS"])
 
+# -----------------------------
+# CATTAS Tab
+# -----------------------------
 with tab2:
-    st.subheader("🏹 Manage Cattas (max 2x each)")
-    file = st.file_uploader("Upload Cattas Excel", type=["xlsx"], key="cattas_up")
-    if file:
-        st.session_state.CATTAS = pd.read_excel(file)
-        if "UsesLeft" not in st.session_state.CATTAS.columns:
-            st.session_state.CATTAS["UsesLeft"]=2
-    st.session_state.CATTAS = st.data_editor(st.session_state.CATTAS, num_rows="dynamic")
+    st.subheader("🏹 Manage Cattas")
+    uploaded = st.file_uploader("Upload Cattas (Excel)", type=["xlsx"])
+    if uploaded:
+        st.session_state.CATTAS = pd.read_excel(uploaded)
+    editable_table("CATTAS", ["Name", "X", "Y", "Speed", "TS"])
 
+# -----------------------------
+# PICKUPS Tab
+# -----------------------------
 with tab3:
-    st.subheader("🏛 Manage Pickups")
-    file = st.file_uploader("Upload Pickups Excel", type=["xlsx"], key="pickups_up")
-    if file:
-        st.session_state.PICKUPS = pd.read_excel(file)
-    st.session_state.PICKUPS = st.data_editor(st.session_state.PICKUPS, num_rows="dynamic")
+    st.subheader("🏛 Manage Pickups / Treasuries")
+    uploaded = st.file_uploader("Upload Pickups (Excel)", type=["xlsx"])
+    if uploaded:
+        st.session_state.PICKUPS = pd.read_excel(uploaded)
+    editable_table("PICKUPS", ["Name", "X", "Y", "Treasury", "Speed", "TS"])
 
+# -----------------------------
+# TARGETS Tab
+# -----------------------------
 with tab4:
-    st.subheader("📜 Paste Artefact Overview")
-    text = st.text_area("Paste Travian artefact overview here")
-    if st.button("Parse Overview"):
-        df = parse_overview(text)
-        st.session_state.TARGETS = df
-        st.success(f"Parsed {len(df)} targets")
-    st.dataframe(st.session_state.TARGETS)
+    st.subheader("🎯 Parse Targets from Travian HTML Source")
+    text = st.text_area("Paste Travian artefact HTML here")
 
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        if st.button("Parse Small Artifacts"):
+            df = parse_small_artifacts(text)
+            if not df.empty:
+                st.session_state.TARGETS = pd.concat([st.session_state.TARGETS, df], ignore_index=True)
+                st.success(f"Added {len(df)} small artifacts")
+    with col2:
+        if st.button("Parse Large Artifacts"):
+            df = parse_large_artifacts(text)
+            if not df.empty:
+                st.session_state.TARGETS = pd.concat([st.session_state.TARGETS, df], ignore_index=True)
+                st.success(f"Added {len(df)} large artifacts")
+    with col3:
+        if st.button("Clear all Targets"):
+            st.session_state.TARGETS = pd.DataFrame(columns=["Name", "Player", "Alliance", "Distance", "Type", "Delete"])
+
+    # Targets table with delete option
+    editable_table("TARGETS", ["Name", "Player", "Alliance", "Distance", "Type"])
+
+# -----------------------------
+# PLANNER Tab
+# -----------------------------
 with tab5:
-    st.subheader("🗺 Planner")
-    if st.button("Run Planner"):
-        if st.session_state.TARGETS.empty:
-            st.warning("No targets loaded")
-        else:
-            planned, unplanned = plan_targets(
-                st.session_state.TARGETS,
-                st.session_state.OFFS,
-                st.session_state.CATTAS,
-                st.session_state.PICKUPS
-            )
-            st.session_state["PLANNED"]=planned
-            st.session_state["UNPLANNED"]=unplanned
+    st.subheader("📑 Plan Runs")
+    if st.button("Create Plan"):
+        create_plan()
 
-    if "PLANNED" in st.session_state:
-        st.success("Planned Runs")
-        st.dataframe(st.session_state["PLANNED"])
-        st.error("Unplanned Artefacts")
-        st.dataframe(st.session_state["UNPLANNED"])
+    if not st.session_state.PLANS.empty:
+        st.success("Plan created!")
+        st.dataframe(st.session_state.PLANS)
+    else:
+        st.info("No plan yet.")
