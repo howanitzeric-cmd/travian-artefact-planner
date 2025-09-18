@@ -5,73 +5,158 @@ from bs4 import BeautifulSoup
 
 st.set_page_config(page_title="Travian Artefact Planner", layout="wide")
 
-# -----------------------------
-# Session init
-# -----------------------------
-def _init_df(cols):
-    return pd.DataFrame(columns=cols)
+# ==============================
+# Session init (clean defaults)
+# ==============================
+def _df(cols): return pd.DataFrame(columns=cols)
 
 if "OFFS" not in st.session_state:
-    st.session_state.OFFS = _init_df(["Village","Coords","Speed","TS","Type","Delete"])
+    st.session_state.OFFS = _df(["Name","coord_x","coord_y","Speed","TS","Type"])
 if "CATTAS" not in st.session_state:
-    st.session_state.CATTAS = _init_df(["Village","Coords","Speed","TS","UsesLeft","Delete"])
+    st.session_state.CATTAS = _df(["Name","coord_x","coord_y","Speed","TS","UsesLeft"])
 if "PICKUPS" not in st.session_state:
-    st.session_state.PICKUPS = _init_df(["Village","Coords","Treasury","Speed","TS","Delete"])
+    st.session_state.PICKUPS = _df(["Name","coord_x","coord_y","Treasury","Speed","TS"])
 if "TARGETS" not in st.session_state:
-    st.session_state.TARGETS = _init_df(["Artefact","Coords","Type","Delete"])
+    st.session_state.TARGETS = _df(["Artefact","Type","coord_x","coord_y"])
 if "PLANNED" not in st.session_state:
     st.session_state.PLANNED = pd.DataFrame()
 if "UNPLANNED" not in st.session_state:
     st.session_state.UNPLANNED = pd.DataFrame()
 
 VALID_TYPES = {"small","large","unique"}
-
-# -----------------------------
-# Helpers
-# -----------------------------
 COORD_RE = re.compile(r"\(\s*([−-]?\d+)\s*\|\s*([−-]?\d+)\s*\)")
 
-def norm_minus(s: str) -> str:
+def nminus(s:str) -> str:
     return s.replace("−","-") if isinstance(s,str) else s
 
-def coords_to_xy(coord_str):
-    if not isinstance(coord_str,str): return None
-    m = COORD_RE.search(norm_minus(coord_str))
-    if not m: return None
-    x = int(norm_minus(m.group(1))); y = int(norm_minus(m.group(2)))
-    return x, y
+# ==================================
+# Data editor w/ per-row delete UX
+# ==================================
+def editor_with_delete(df: pd.DataFrame, cols: list, key: str, title: str):
+    st.markdown(f"### {title}")
+    # add a temporary delete checkbox column (never persisted outside this session render)
+    tmp = df.copy()
+    tmp["_DELETE"] = False
+    edited = st.data_editor(
+        tmp, num_rows="dynamic", use_container_width=True,
+        column_config={"_DELETE": st.column_config.CheckboxColumn("Delete")},
+        key=f"editor_{key}"
+    )
+    # delete selected
+    if st.button(f"Delete selected in {title}", key=f"delbtn_{key}"):
+        edited = edited[~edited["_DELETE"]].drop(columns=["_DELETE"])
+        st.success("Selected rows deleted.")
+    # clear all
+    if st.button(f"Clear all {title}", key=f"clearbtn_{key}"):
+        edited = _df(cols)
+        st.warning("All rows cleared.")
+    # normalize cols & types
+    for c in cols:
+        if c not in edited.columns: edited[c] = pd.NA
+    edited = edited[cols]
+    st.session_state[key] = edited
+    return edited
 
-def ensure_delete_bool(df: pd.DataFrame):
-    if "Delete" not in df.columns:
-        df["Delete"] = False
-    else:
-        df["Delete"] = df["Delete"].fillna(False).astype(bool)
+# ==========================
+# Upload helpers (optional)
+# ==========================
+def upload_excel(file, expected_cols, key_for_state):
+    try:
+        df = pd.read_excel(file)
+        # map common aliases
+        lower_map = {c.lower(): c for c in df.columns}
+        aliases = {
+            "name": ["village","dorf","spieler","player"],
+            "coord_x": ["x","coord x","koordinate x"],
+            "coord_y": ["y","coord y","koordinate y"],
+            "speed": ["geschwindigkeit","tempo"],
+            "ts": ["tournament square","turnierplatz","tp"],
+            "type": ["typ","art","category"],
+            "treasury": ["treasury level","schatzkammer","kammer","level"],
+            "usesleft": ["uses","left","rest"]
+        }
+        out = pd.DataFrame()
+        for col in expected_cols:
+            if col in df.columns:
+                out[col] = df[col]
+                continue
+            if col.lower() in lower_map:
+                out[col] = df[lower_map[col.lower()]]
+                continue
+            matched = None
+            for a in aliases.get(col.lower(), []):
+                if a in lower_map:
+                    matched = lower_map[a]
+                    break
+            out[col] = df.get(matched, pd.NA)
+        # also support legacy "Coords" -> split
+        if "Coords" in df.columns and ("coord_x" in expected_cols or "coord_y" in expected_cols):
+            for i, val in df["Coords"].fillna("").items():
+                m = COORD_RE.search(nminus(str(val)))
+                if m:
+                    if "coord_x" in expected_cols:
+                        out.at[i,"coord_x"] = int(nminus(m.group(1)))
+                    if "coord_y" in expected_cols:
+                        out.at[i,"coord_y"] = int(nminus(m.group(2)))
+        # defaults
+        if "UsesLeft" in out.columns:
+            out["UsesLeft"] = pd.to_numeric(out["UsesLeft"], errors="coerce").fillna(2).astype(int)
+        st.session_state[key_for_state] = out[expected_cols]
+        st.success(f"Loaded {len(out)} rows into {key_for_state}.")
+    except Exception as e:
+        st.error(f"Upload failed: {e}")
+
+# ==========================
+# HTML parsing (Targets)
+# ==========================
+def classify_type(group_hint:str, name:str) -> str:
+    n = (name or "").lower()
+    if "unique" in n or "einzig" in n: return "unique"
+    if group_hint == "large": return "large"
+    return "small"
+
+def parse_artefacts_html(html: str, group_hint: str) -> pd.DataFrame:
+    """
+    Parse Travian artefact 'overview' HTML. These tables have headers like Name/Spieler/Allianz/Entfernung.
+    Coordinates are usually NOT present there -> we leave coord_x/y empty (you can fill manually or attach later).
+    """
+    soup = BeautifulSoup(html, "html.parser")
+    rows = []
+    for tbl in soup.find_all("table"):
+        headers = " ".join(th.get_text(strip=True).lower() for th in tbl.find_all("th"))
+        if "name" in headers and ("entfernung" in headers or "distance" in headers):
+            for tr in tbl.find_all("tr"):
+                tds = tr.find_all("td")
+                if not tds: continue
+                name = tds[0].get_text(" ", strip=True)
+                if not name: continue
+                typ = classify_type(group_hint, name)
+                rows.append({"Artefact": name, "Type": typ, "coord_x": pd.NA, "coord_y": pd.NA})
+    return pd.DataFrame(rows)
+
+def parse_coords_from_any_text(text: str) -> list[tuple[int,int]]:
+    coords = []
+    for m in COORD_RE.finditer(nminus(text)):
+        x = int(nminus(m.group(1))); y = int(nminus(m.group(2)))
+        coords.append((x,y))
+    return coords
+
+def attach_coords_in_order(targets_df: pd.DataFrame, coords: list[tuple[int,int]]) -> pd.DataFrame:
+    df = targets_df.copy()
+    j = 0
+    for i in df.index:
+        if (pd.isna(df.at[i,"coord_x"]) or pd.isna(df.at[i,"coord_y"])) and j < len(coords):
+            df.at[i,"coord_x"], df.at[i,"coord_y"] = coords[j]
+            j += 1
     return df
 
-def editable_table(name: str, base_cols: list):
-    """Edit table with Delete checkboxes + delete selected + clear all."""
-    df = st.session_state[name].copy()
-    df = ensure_delete_bool(df)
-    df = st.data_editor(df, num_rows="dynamic", use_container_width=True, key=f"edit_{name}")
-    df = ensure_delete_bool(df)
-    # Delete selected
-    if st.button(f"Delete selected in {name}", key=f"del_{name}"):
-        df = df[~df["Delete"]].drop(columns=["Delete"], errors="ignore")
-        df = ensure_delete_bool(df)
-        st.session_state[name] = df
-        st.success("Deleted selected rows.")
-    # Clear all
-    if st.button(f"Clear all {name}", key=f"clear_{name}"):
-        st.session_state[name] = ensure_delete_bool(_init_df(base_cols))
-        st.warning("Cleared.")
-        df = st.session_state[name]
-    st.session_state[name] = df
-    return df
-
+# ==========================
+# Planner utilities
+# ==========================
 def normalize_off_type(s):
     if not isinstance(s,str): return ""
     s = s.strip().lower().replace("ß","ss")
-    if "uni" in s: return "unique"
+    if "uni" in s or "einzig" in s: return "unique"
     if any(w in s for w in ["gross","groß","large","big"]): return "large"
     if "small" in s or "klein" in s: return "small"
     return s
@@ -92,201 +177,109 @@ def pickup_compat(treasury, arti_type):
 def priority_key(name, typ):
     name = (name or "").lower()
     typ  = (typ or "").lower()
-    if typ == "unique" or "unique" in name: return (1,0)
+    if typ == "unique" or "unique" in name or "einzig" in name: return (1,0)
     if any(k in name for k in ["trainer","ausbilder"]): return (2,0)
     if any(k in name for k in ["diet","getreide","hunger"]): return (2,1)
     if any(k in name for k in ["boots","stiefel","schnellere truppen"]): return (2,2)
     if any(k in name for k in ["eyes","auge","späher","scout","spaeher"]): return (2,3)
-    if any(k in name for k in ["plan","bauplan","great warehouse","lager","granary","blueprint"]): return (3,0)
+    if any(k in name for k in ["plan","bauplan","great warehouse","lager","granary","blueprint","weltwunder"]): return (3,0)
     return (4,0)
 
 def ts_travel_hours(x1,y1,x2,y2,speed,ts_level):
-    """First 20 tiles base speed, remainder at speed*(1+0.1*TS)."""
-    if speed is None: return float("inf")
+    # first 20 tiles at base speed, remainder with TS bonus (+10% per level)
     try:
         speed = float(speed); ts = float(ts_level) if ts_level not in (None,"") else 0.0
     except: return float("inf")
-    dx = (x1-x2); dy=(y1-y2)
-    d = math.hypot(dx,dy)
+    d = math.hypot((x1-x2),(y1-y2))
     if d <= 20: return d/speed
     first = 20/speed
     rest  = (d-20)/(speed*(1.0+0.1*ts))
     return first+rest
 
-# -----------------------------
-# Parse Travian HTML for artefacts
-# -----------------------------
-def parse_artifacts_html(html: str, arte_type_hint: str) -> pd.DataFrame:
-    """
-    Parse Travian artefact page HTML (page source) into targets.
-    We try to extract rows (Name/Player/Alliance/Distance). If coords like (x|y) appear anywhere in the HTML,
-    we associate them to the found artefacts in order; otherwise coords stay None and can be edited manually.
-    """
-    soup = BeautifulSoup(html, "html.parser")
-    text = soup.get_text("\n")
-    # Collect table-like lines in order
-    lines = [l.strip() for l in text.split("\n") if l.strip()]
-    # Extract artefact name lines: they typically look like "Baumeister I (...)" etc., followed by Schatzkammer...
-    arte_rows = []
-    for i, line in enumerate(lines):
-        low = line.lower()
-        if ("schatzkammer" in low or "treasure" in low) and i >= 1:
-            name = lines[i-1].strip()
-            # classify type from name + hint
-            typ = arte_type_hint
-            lowname = name.lower()
-            if "unique" in lowname or "einzig" in lowname:
-                typ = "unique"
-            elif arte_type_hint == "large" and typ != "unique":
-                typ = "large"
-            elif arte_type_hint == "small":
-                typ = "small"
-            arte_rows.append({"Artefact": name, "Type": typ})
-
-    # Pull all coords present in HTML text (order preserved)
-    coords = []
-    for m in COORD_RE.finditer(norm_minus(text)):
-        x = int(norm_minus(m.group(1))); y = int(norm_minus(m.group(2)))
-        coords.append((x,y))
-
-    # Attach coords in order (best-effort; user can edit)
-    out = []
-    for idx, row in enumerate(arte_rows):
-        x=y=None
-        if idx < len(coords):
-            x,y = coords[idx]
-        coord_str = f"({x}|{y})" if x is not None else ""
-        out.append({"Artefact": row["Artefact"], "Coords": coord_str, "Type": row["Type"], "Delete": False})
-    return pd.DataFrame(out)
-
-# -----------------------------
-# Upload helpers
-# -----------------------------
-def upload_excel(file, expected_cols):
-    try:
-        df = pd.read_excel(file)
-        # keep only expected + try to map common aliases
-        colmap = {c.lower(): c for c in df.columns}
-        out = pd.DataFrame()
-        for col in expected_cols:
-            # attempt loose matching
-            key = col.lower()
-            if key in colmap:
-                out[col] = df[colmap[key]]
-            else:
-                # try simple aliases
-                aliases = {
-                    "village": ["name","spieler","player","dorf"],
-                    "coords":  ["coord","koords","x|y","x,y","coordinate"],
-                    "speed":   ["geschwindigkeit","tempo"],
-                    "ts":      ["tournament square","turnierplatz","tp"],
-                    "type":    ["typ","art","category"],
-                    "treasury":["schatzkammer","level","treasury level","kammer"],
-                    "usesleft":["uses","left","rest"]
-                }
-                matched = None
-                for a in aliases.get(key, []):
-                    if a in colmap: matched = colmap[a]; break
-                out[col] = df.get(matched, None)
-        out["Delete"] = False
-        return ensure_delete_bool(out)
-    except Exception as e:
-        st.error(f"Upload failed: {e}")
-        return ensure_delete_bool(_init_df(expected_cols))
-
-# -----------------------------
-# Planner
-# -----------------------------
-def plan_once():
+# ==========================
+# Planner (assignment)
+# ==========================
+def create_plan():
     offs = st.session_state.OFFS.copy()
-    catt = st.session_state.CATTAS.copy()
-    pick = st.session_state.PICKUPS.copy()
+    cats = st.session_state.CATTAS.copy()
+    pics = st.session_state.PICKUPS.copy()
     tars = st.session_state.TARGETS.copy()
 
-    # normalize fields
+    # normalize types/defaults
     offs["Type"] = offs["Type"].map(normalize_off_type).fillna("")
-    catt["UsesLeft"] = pd.to_numeric(catt.get("UsesLeft", 2), errors="coerce").fillna(2).astype(int)
-    pick["Treasury"] = pd.to_numeric(pick.get("Treasury", 0), errors="coerce").fillna(0).astype(int)
+    cats["UsesLeft"] = pd.to_numeric(cats.get("UsesLeft", 2), errors="coerce").fillna(2).astype(int)
+    pics["Treasury"] = pd.to_numeric(pics.get("Treasury", 0), errors="coerce").fillna(0).astype(int)
 
     # sort targets by priority
-    tars["_p1"], tars["_p2"] = zip(*tars.apply(lambda r: priority_key(r["Artefact"], r["Type"]), axis=1)) if not tars.empty else ([],[])
-    tars = tars.sort_values(by=["_p1","_p2"]).drop(columns=["_p1","_p2"], errors="ignore").reset_index(drop=True)
+    if not tars.empty:
+        p1, p2 = zip(*tars.apply(lambda r: priority_key(r["Artefact"], r["Type"]), axis=1))
+        tars["_p1"], tars["_p2"] = p1, p2
+        tars = tars.sort_values(by=["_p1","_p2"]).drop(columns=["_p1","_p2"])
 
-    planned = []
-    unplanned = []
-
-    used_off = set()
-    used_pick = set()
+    planned, unplanned = [], []
+    used_off, used_pick = set(), set()
 
     for _, t in tars.iterrows():
-        arti = t.get("Artefact","")
-        typ  = (t.get("Type","") or "").lower()
-        target_xy = coords_to_xy(t.get("Coords",""))
+        name = t.get("Artefact",""); typ = (t.get("Type","") or "").lower()
+        tx, ty = t.get("coord_x"), t.get("coord_y")
+
+        # basic validations
         if typ not in VALID_TYPES:
-            unplanned.append({"Artefact": arti, "Reason": f"Invalid type '{typ}'"})
-            continue
-        if not target_xy:
-            unplanned.append({"Artefact": arti, "Reason": "Missing coordinates"})
-            continue
+            unplanned.append({"Artefact": name, "Reason":"Invalid type"}); continue
+        if pd.isna(tx) or pd.isna(ty):
+            unplanned.append({"Artefact": name, "Reason":"Missing coordinates"}); continue
+        tx, ty = float(tx), float(ty)
 
-        tx, ty = target_xy
-
-        # pick OFF
-        best_off = None; best_off_eta = float("inf"); best_off_idx = None
+        # OFF match (usable once, type compat, fastest ETA)
+        best_off=None; best_off_eta=float("inf"); best_off_idx=None
         for idx, o in offs.iterrows():
             if idx in used_off: continue
             if not off_compat(o.get("Type",""), typ): continue
-            o_xy = coords_to_xy(o.get("Coords",""))
-            if not o_xy: continue
-            eta = ts_travel_hours(o_xy[0],o_xy[1],tx,ty,o.get("Speed",0),o.get("TS",0))
+            if pd.isna(o.get("coord_x")) or pd.isna(o.get("coord_y")): continue
+            eta = ts_travel_hours(float(o["coord_x"]),float(o["coord_y"]),tx,ty,o.get("Speed",0),o.get("TS",0))
             if eta < best_off_eta:
-                best_off_eta = eta; best_off = o; best_off_idx = idx
+                best_off_eta=eta; best_off=o; best_off_idx=idx
         if best_off is None:
-            unplanned.append({"Artefact": arti, "Reason": "No compatible OFF"})
-            continue
+            unplanned.append({"Artefact": name, "Reason":"No compatible OFF"}); continue
 
-        # pick CATTAS (fastest with UsesLeft>0)
-        best_cat = None; best_cat_eta = float("inf"); best_cat_idx = None
-        for idx, c in catt.iterrows():
+        # CATA match (max 2 uses; fastest ETA)
+        best_cat=None; best_cat_eta=float("inf"); best_cat_idx=None
+        for idx, c in cats.iterrows():
             if c.get("UsesLeft",0) <= 0: continue
-            c_xy = coords_to_xy(c.get("Coords",""))
-            if not c_xy: continue
-            eta = ts_travel_hours(c_xy[0],c_xy[1],tx,ty,c.get("Speed",0),c.get("TS",0))
+            if pd.isna(c.get("coord_x")) or pd.isna(c.get("coord_y")): continue
+            eta = ts_travel_hours(float(c["coord_x"]),float(c["coord_y"]),tx,ty,c.get("Speed",0),c.get("TS",0))
             if eta < best_cat_eta:
-                best_cat_eta = eta; best_cat = c; best_cat_idx = idx
+                best_cat_eta=eta; best_cat=c; best_cat_idx=idx
         if best_cat is None:
-            unplanned.append({"Artefact": arti, "Reason": "No CATA with uses left"})
-            continue
+            unplanned.append({"Artefact": name, "Reason":"No CATA with uses left"}); continue
 
-        # pick PICKUP (treasury compatible)
-        best_pick_row=None; best_pick_eta=float("inf"); best_pick_idx=None
-        for idx, p in pick.iterrows():
+        # PICKUP match (treasury compat; usable once; fastest ETA)
+        best_pick=None; best_pick_eta=float("inf"); best_pick_idx=None
+        for idx, p in pics.iterrows():
             if idx in used_pick: continue
             if not pickup_compat(p.get("Treasury",0), typ): continue
-            p_xy = coords_to_xy(p.get("Coords",""))
-            if not p_xy: continue
-            eta = ts_travel_hours(p_xy[0],p_xy[1],tx,ty,p.get("Speed",0),p.get("TS",0))
+            if pd.isna(p.get("coord_x")) or pd.isna(p.get("coord_y")): continue
+            eta = ts_travel_hours(float(p["coord_x"]),float(p["coord_y"]),tx,ty,p.get("Speed",0),p.get("TS",0))
             if eta < best_pick_eta:
-                best_pick_eta = eta; best_pick_row=p; best_pick_idx=idx
-        if best_pick_row is None:
-            unplanned.append({"Artefact": arti, "Reason": "No compatible PICKUP (treasury)"})
-            continue
+                best_pick_eta=eta; best_pick=p; best_pick_idx=idx
+        if best_pick is None:
+            unplanned.append({"Artefact": name, "Reason":"No compatible PICKUP (treasury)"}); continue
 
-        # reserve
+        # reserve resources
         used_off.add(best_off_idx)
         used_pick.add(best_pick_idx)
-        catt.at[best_cat_idx,"UsesLeft"] = int(catt.at[best_cat_idx,"UsesLeft"]) - 1
+        cats.at[best_cat_idx,"UsesLeft"] = int(cats.at[best_cat_idx,"UsesLeft"]) - 1
 
         arrival = max(best_off_eta, best_cat_eta, best_pick_eta)
         planned.append({
-            "Artefact": arti,
+            "Artefact": name,
             "Type": typ,
-            "Target": t.get("Coords",""),
-            "Off": best_off.get("Village",""),
+            "Target (x|y)": f"({int(tx)}|{int(ty)})",
+            "Off": best_off.get("Name",""),
             "Off ETA (h)": round(best_off_eta,2),
-            "Cata": best_cat.get("Village",""),
+            "Cata": best_cat.get("Name",""),
             "Cata ETA (h)": round(best_cat_eta,2),
-            "Pickup": best_pick_row.get("Village",""),
+            "Pickup": best_pick.get("Name",""),
             "Pickup ETA (h)": round(best_pick_eta,2),
             "Arrival (h)": round(arrival,2)
         })
@@ -294,89 +287,77 @@ def plan_once():
     st.session_state.PLANNED = pd.DataFrame(planned)
     st.session_state.UNPLANNED = pd.DataFrame(unplanned)
 
-# -----------------------------
-# UI — Tabs
-# -----------------------------
+# ==========================
+# UI (Tabs)
+# ==========================
 st.title("🏺 Travian Artefact Planner")
 
-tabs = st.tabs(["⚔️ Offs","🏹 Catas","🏛️ Pickups","🎯 Targets (HTML)","📑 Plan"])
+tab_offs, tab_cats, tab_pics, tab_tars, tab_plan = st.tabs([
+    "⚔️ Offs", "🏹 Catas", "🏛️ Pickups", "🎯 Targets (HTML)", "📑 Plan"
+])
 
-# OFFS
-with tabs[0]:
-    st.subheader("⚔️ Offs (Type: small / large / unique — each OFF usable once)")
+with tab_offs:
+    st.subheader("Offs (Type: small / large / unique; OFF usable once)")
     up = st.file_uploader("Upload Offs (Excel)", type=["xlsx","xls"], key="upl_offs")
     if up:
-        st.session_state.OFFS = upload_excel(up, ["Village","Coords","Speed","TS","Type"])
-        st.success(f"Loaded {len(st.session_state.OFFS)} offs from file.")
-    st.caption("Columns: Village, Coords like (x|y), Speed, TS (tournament square level), Type (small/large/unique).")
-    editable_table("OFFS", ["Village","Coords","Speed","TS","Type"])
+        upload_excel(up, ["Name","coord_x","coord_y","Speed","TS","Type"], "OFFS")
+    editor_with_delete(st.session_state.OFFS, ["Name","coord_x","coord_y","Speed","TS","Type"], "OFFS", "Offs")
 
-# CATTAS
-with tabs[1]:
-    st.subheader("🏹 Catas (each village usable up to 2×)")
-    up = st.file_uploader("Upload Catas (Excel)", type=["xlsx","xls"], key="upl_catas")
+with tab_cats:
+    st.subheader("Catas (each row usable up to 2×)")
+    up = st.file_uploader("Upload Catas (Excel)", type=["xlsx","xls"], key="upl_cats")
     if up:
-        df = upload_excel(up, ["Village","Coords","Speed","TS","UsesLeft"])
-        if "UsesLeft" not in df.columns or df["UsesLeft"].isna().all():
-            df["UsesLeft"] = 2
-        st.session_state.CATTAS = df
-        st.success(f"Loaded {len(st.session_state.CATTAS)} cata rows.")
-    st.caption("Columns: Village, Coords (x|y), Speed, TS, UsesLeft (default 2).")
-    # ensure default UsesLeft=2 for empty/new rows
-    if "UsesLeft" in st.session_state.CATTAS.columns:
-        st.session_state.CATTAS["UsesLeft"] = pd.to_numeric(st.session_state.CATTAS["UsesLeft"], errors="coerce").fillna(2).astype(int)
-    editable_table("CATTAS", ["Village","Coords","Speed","TS","UsesLeft"])
+        upload_excel(up, ["Name","coord_x","coord_y","Speed","TS","UsesLeft"], "CATTAS")
+        if st.session_state.CATTAS["UsesLeft"].isna().all():
+            st.session_state.CATTAS["UsesLeft"] = 2
+    editor_with_delete(st.session_state.CATTAS, ["Name","coord_x","coord_y","Speed","TS","UsesLeft"], "CATTAS", "Catas")
 
-# PICKUPS
-with tabs[2]:
-    st.subheader("🏛️ Pickups / Treasuries (each usable once)")
-    up = st.file_uploader("Upload Pickups (Excel)", type=["xlsx","xls"], key="upl_pickups")
+with tab_pics:
+    st.subheader("Pickups / Treasuries (usable once; Treasury<20 = small only, ≥20 = any)")
+    up = st.file_uploader("Upload Pickups (Excel)", type=["xlsx","xls"], key="upl_pics")
     if up:
-        st.session_state.PICKUPS = upload_excel(up, ["Village","Coords","Treasury","Speed","TS"])
-        st.success(f"Loaded {len(st.session_state.PICKUPS)} pickups.")
-    st.caption("Columns: Village, Coords (x|y), Treasury (int), Speed, TS.")
-    editable_table("PICKUPS", ["Village","Coords","Treasury","Speed","TS"])
+        upload_excel(up, ["Name","coord_x","coord_y","Treasury","Speed","TS"], "PICKUPS")
+    editor_with_delete(st.session_state.PICKUPS, ["Name","coord_x","coord_y","Treasury","Speed","TS"], "PICKUPS", "Pickups")
 
-# TARGETS
-with tabs[3]:
-    st.subheader("🎯 Targets from Travian HTML page source")
-    st.caption("Paste the page *source* (HTML) of the artefact list. Parse small and large/unique separately if needed.")
-    mode = st.radio("Which list is this HTML for?", ["Small","Large/Unique"], horizontal=True)
-    html = st.text_area("Paste HTML source here", height=220)
-    col1,col2,col3 = st.columns(3)
-    with col1:
-        if st.button("Parse from HTML"):
-            if html.strip():
-                hint = "small" if mode == "Small" else "large"
-                df = parse_artifacts_html(html, hint)
-                if not df.empty:
-                    # normalize types to known set
-                    df["Type"] = df["Type"].map(lambda x: "unique" if x=="unique" else ("large" if x=="large" else "small"))
-                    cur = st.session_state.TARGETS.copy()
-                    cur = pd.concat([cur, df], ignore_index=True)
-                    st.session_state.TARGETS = ensure_delete_bool(cur)
-                    st.success(f"Added {len(df)} targets.")
+with tab_tars:
+    st.subheader("Targets from Travian HTML")
+    st.caption("1) Paste artefact page *HTML* (Small or Large/Unique) → Parse names & types. "
+               "2) (Optional) Paste any text/HTML that contains coordinates like (x|y) → attach by order. "
+               "You can also edit coord_x/coord_y manually below.")
+    colA, colB = st.columns(2)
+    with colA:
+        mode = st.radio("This HTML is for:", ["Small","Large/Unique"], horizontal=True, key="mode_art")
+        html_art = st.text_area("Paste artefact page HTML", height=220, key="html_art")
+        if st.button("Parse artefacts", key="parse_art"):
+            if html_art.strip():
+                hint = "small" if st.session_state.mode_art == "Small" else "large"
+                df = parse_artefacts_html(html_art, hint)
+                if df.empty:
+                    st.warning("No artefacts found in this HTML.")
                 else:
-                    st.warning("No targets found in this HTML.")
+                    st.session_state.TARGETS = pd.concat([st.session_state.TARGETS, df], ignore_index=True)
+                    st.success(f"Added {len(df)} targets. Fill in coordinates below or attach via right box.")
             else:
-                st.warning("Please paste HTML first.")
-    with col2:
-        if st.button("Clear all Targets"):
-            st.session_state.TARGETS = ensure_delete_bool(_init_df(["Artefact","Coords","Type"]))
-            st.warning("Targets cleared.")
-    with col3:
-        st.write("")  # spacer
-    st.dataframe(st.session_state.TARGETS, use_container_width=True)
+                st.warning("Please paste artefact HTML.")
+    with colB:
+        html_coords = st.text_area("Paste ANY text/HTML that contains coordinates (x|y)", height=220, key="html_coords")
+        if st.button("Attach coords by order", key="attach_coords"):
+            coords = parse_coords_from_any_text(html_coords)
+            if not coords:
+                st.warning("No coordinates found.")
+            else:
+                st.session_state.TARGETS = attach_coords_in_order(st.session_state.TARGETS, coords)
+                st.success("Coordinates attached (by order).")
+    editor_with_delete(st.session_state.TARGETS, ["Artefact","Type","coord_x","coord_y"], "TARGETS", "Targets")
 
-# PLAN
-with tabs[4]:
-    st.subheader("📑 Create Plan")
-    st.caption("Rules: OFF=1×, CATA=2×/village, PICKUP=1×; Type & Treasury compatibility enforced; priority applied.")
+with tab_plan:
+    st.subheader("Create Plan")
+    st.caption("Rules: OFF=1×, CATA=2×/row, PICKUP=1×; Type & Treasury compatibility; priority applied; TS travel time.")
     if st.button("Create / Update Plan", type="primary"):
         if st.session_state.OFFS.empty or st.session_state.CATTAS.empty or st.session_state.PICKUPS.empty or st.session_state.TARGETS.empty:
             st.error("Please provide OFFS, CATTAS, PICKUPS and TARGETS first.")
         else:
-            plan_once()
+            create_plan()
             st.success("Plan created.")
     if not st.session_state.PLANNED.empty:
         st.markdown("### ✅ Planned")
