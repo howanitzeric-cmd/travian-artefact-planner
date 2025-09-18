@@ -4,6 +4,9 @@ import re, math
 
 st.set_page_config(page_title="Travian Artefact Planner", layout="wide")
 
+VALID_TYPES = ["small","large","unique"]
+MAP_SIZE = 401
+
 # -----------------------------
 # Init session state
 # -----------------------------
@@ -14,9 +17,7 @@ if "CATTAS" not in st.session_state:
 if "PICKUPS" not in st.session_state:
     st.session_state.PICKUPS = pd.DataFrame(columns=["Name","X","Y","Speed","TS","Treasury"])
 if "TARGETS" not in st.session_state:
-    st.session_state.TARGETS = pd.DataFrame(columns=["Name","Type","X","Y","Treasury","Distance"])
-
-MAP_SIZE = 401
+    st.session_state.TARGETS = pd.DataFrame(columns=["Name","Type","X","Y","Treasury"])
 
 # -----------------------------
 # Helpers
@@ -54,7 +55,11 @@ def parse_overview(text):
             m2=COORD_RE.search("\n".join(lines[i:i+30]))
             x=y=None
             if m2: x=int(m2.group(1)); y=int(m2.group(2))
-            rows.append(dict(Name=name,Type=name,X=x,Y=y,Treasury=tre))
+            arti_type="small"
+            n=name.lower()
+            if "unique" in n: arti_type="unique"
+            elif "groß" in n or "gross" in n or "large" in n or "plan" in n: arti_type="large"
+            rows.append(dict(Name=name,Type=arti_type,X=x,Y=y,Treasury=tre))
     return pd.DataFrame(rows)
 
 # -----------------------------
@@ -62,7 +67,7 @@ def parse_overview(text):
 # -----------------------------
 def arti_priority(name, typ):
     n=(name or "").lower()
-    if "unique" in n or "einzig" in n: return 1
+    if typ=="unique": return 1
     if "trainer" in n or "ausbilder" in n: return 2
     if "diet" in n or "getreide" in n: return 3
     if "boots" in n or "stiefel" in n: return 4
@@ -91,10 +96,16 @@ def plan_targets(targets, offs, cattas, pickups):
     for _, t in targets.iterrows():
         tx, ty = t["X"], t["Y"]
 
+        # check type validity
+        if t["Type"] not in VALID_TYPES:
+            unplanned.append({"Artefact":t["Name"],"Reason":f"Invalid type {t['Type']}"})
+            continue
+
         # find OFF
         best_off = None; best_off_time=float("inf")
         for i,o in offs.iterrows():
             if o["_used"]: continue
+            if str(o["Type"]).lower() not in VALID_TYPES: continue
             dist=wrap_distance(o["X"],o["Y"],tx,ty,MAP_SIZE)
             ttime=travel_time(dist,o["Speed"],o["TS"])
             if ttime<best_off_time:
@@ -135,6 +146,7 @@ def plan_targets(targets, offs, cattas, pickups):
         # record
         planned.append({
             "Artefact":t["Name"],
+            "Type":t["Type"],
             "Off":best_off[1]["Name"], "Off ETA":fmt_hms(best_off_time),
             "Cattas":best_catta[1]["Name"], "Catta ETA":fmt_hms(best_catta_time),
             "Pickup":best_pick[1]["Name"], "Pickup ETA":fmt_hms(best_pick_time),
@@ -149,21 +161,30 @@ tab1, tab2, tab3, tab4, tab5 = st.tabs(["Offs","Cattas","Pickups","Targets","Pla
 
 with tab1:
     st.subheader("⚔️ Manage Offs")
+    file = st.file_uploader("Upload Offs Excel", type=["xlsx"], key="offs_up")
+    if file:
+        st.session_state.OFFS = pd.read_excel(file)
     st.session_state.OFFS = st.data_editor(st.session_state.OFFS, num_rows="dynamic")
 
 with tab2:
-    st.subheader("🏹 Manage Cattas (each row max 2x)")
-    if "UsesLeft" not in st.session_state.CATTAS.columns:
-        st.session_state.CATTAS["UsesLeft"]=2
+    st.subheader("🏹 Manage Cattas (max 2x each)")
+    file = st.file_uploader("Upload Cattas Excel", type=["xlsx"], key="cattas_up")
+    if file:
+        st.session_state.CATTAS = pd.read_excel(file)
+        if "UsesLeft" not in st.session_state.CATTAS.columns:
+            st.session_state.CATTAS["UsesLeft"]=2
     st.session_state.CATTAS = st.data_editor(st.session_state.CATTAS, num_rows="dynamic")
 
 with tab3:
-    st.subheader("🏛 Manage Pickups (Treasuries)")
+    st.subheader("🏛 Manage Pickups")
+    file = st.file_uploader("Upload Pickups Excel", type=["xlsx"], key="pickups_up")
+    if file:
+        st.session_state.PICKUPS = pd.read_excel(file)
     st.session_state.PICKUPS = st.data_editor(st.session_state.PICKUPS, num_rows="dynamic")
 
 with tab4:
     st.subheader("📜 Paste Artefact Overview")
-    text = st.text_area("Paste Travian artefact overview text/HTML here")
+    text = st.text_area("Paste Travian artefact overview here")
     if st.button("Parse Overview"):
         df = parse_overview(text)
         st.session_state.TARGETS = df
@@ -172,12 +193,10 @@ with tab4:
 
 with tab5:
     st.subheader("🗺 Planner")
-    if st.session_state.TARGETS.empty:
-        st.info("Paste artefacts first.")
-    elif st.session_state.OFFS.empty or st.session_state.CATTAS.empty or st.session_state.PICKUPS.empty:
-        st.info("Fill Offs, Cattas, and Pickups first.")
-    else:
-        if st.button("Run Planner"):
+    if st.button("Run Planner"):
+        if st.session_state.TARGETS.empty:
+            st.warning("No targets loaded")
+        else:
             planned, unplanned = plan_targets(
                 st.session_state.TARGETS,
                 st.session_state.OFFS,
@@ -187,10 +206,8 @@ with tab5:
             st.session_state["PLANNED"]=planned
             st.session_state["UNPLANNED"]=unplanned
 
-        if "PLANNED" in st.session_state:
-            if not st.session_state["PLANNED"].empty:
-                st.success("Planned Runs")
-                st.dataframe(st.session_state["PLANNED"])
-            if not st.session_state["UNPLANNED"].empty:
-                st.error("Unplanned Artefacts")
-                st.dataframe(st.session_state["UNPLANNED"])
+    if "PLANNED" in st.session_state:
+        st.success("Planned Runs")
+        st.dataframe(st.session_state["PLANNED"])
+        st.error("Unplanned Artefacts")
+        st.dataframe(st.session_state["UNPLANNED"])
