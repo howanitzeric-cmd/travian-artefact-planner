@@ -1,140 +1,196 @@
 import streamlit as st
 import pandas as pd
-import math
+import re, math
 
-# -----------------------------
-# Config
-# -----------------------------
-PRIORITY_ORDER = [
-    "Unique",       # Unique artefacts first
-    "Trainer",      # then Trainer
-    "Diet",
-    "Boots",
-    "Eyes",
-    "Plans",        # Great Warehouse/Lager plans
-    "Others"
-]
-
-# -----------------------------
-# Helper functions
-# -----------------------------
-def travel_time(distance, speed, ts_level):
-    """
-    Calculate travel time considering tournament square.
-    Travian TS bonus applies after 20 tiles.
-    """
-    if distance <= 20:
-        return distance / speed
-    else:
-        normal = 20 / speed
-        bonus = (distance - 20) / (speed * (1 + 0.2 * ts_level))
-        return normal + bonus
-
-
-def assign_offs_and_cattas(targets, offs, cattas, pickups):
-    """
-    Core logic: assign best offs and cattas to artefacts
-    while respecting priorities and usage constraints.
-    """
-
-    plans = []
-    used_offs = set()
-    used_cattas = {}
-
-    for priority in PRIORITY_ORDER:
-        for _, arti in targets[targets["Type"].str.contains(priority, case=False, na=False)].iterrows():
-            arti_name = arti["Name"]
-            arti_dist = arti["Distance"]
-
-            # find best Off not yet used
-            best_off = None
-            best_time = float("inf")
-
-            for _, off in offs.iterrows():
-                if off["Name"] in used_offs:
-                    continue
-                time = travel_time(arti_dist, off["Speed"], off["TS"])
-                if time < best_time:
-                    best_time = time
-                    best_off = off
-
-            if best_off is None:
-                continue
-
-            # find best Catta (max 2 uses)
-            best_catta = None
-            best_catta_time = float("inf")
-
-            for _, cat in cattas.iterrows():
-                count = used_cattas.get(cat["Name"], 0)
-                if count >= 2:
-                    continue
-                time = travel_time(arti_dist, cat["Speed"], cat["TS"])
-                if time < best_catta_time:
-                    best_catta_time = time
-                    best_catta = cat
-
-            # assign pickup (treasury)
-            best_pickup = None
-            if not pickups.empty:
-                if "Unique" in arti["Type"]:
-                    best_pickup = pickups[pickups["Treasury"] >= 20].head(1)
-                elif "Great" in arti["Type"]:
-                    best_pickup = pickups[pickups["Treasury"] >= 10].head(1)
-                else:
-                    best_pickup = pickups[pickups["Treasury"] >= 5].head(1)
-
-                if not best_pickup.empty:
-                    pickups = pickups.drop(best_pickup.index)
-
-            # record plan
-            plans.append({
-                "Artefact": arti_name,
-                "Priority": priority,
-                "Off": best_off["Name"],
-                "Off time (h)": round(best_time, 2),
-                "Cattas": best_catta["Name"] if best_catta is not None else "-",
-                "Catta time (h)": round(best_catta_time, 2) if best_catta is not None else "-",
-                "Pickup": best_pickup["Name"].values[0] if best_pickup is not None and not best_pickup.empty else "-"
-            })
-
-            used_offs.add(best_off["Name"])
-            if best_catta is not None:
-                used_cattas[best_catta["Name"]] = used_cattas.get(best_catta["Name"], 0) + 1
-
-    return pd.DataFrame(plans)
-
-# -----------------------------
-# Streamlit UI
-# -----------------------------
 st.set_page_config(page_title="Travian Artefact Planner", layout="wide")
-st.title("🏺 Travian Artefact Planner")
 
-st.sidebar.header("Upload Data")
-offs_file = st.sidebar.file_uploader("Upload Offs Excel", type=["xlsx"], key="offs")
-cattas_file = st.sidebar.file_uploader("Upload Cattas Excel", type=["xlsx"], key="cattas")
-pickups_file = st.sidebar.file_uploader("Upload Pickups Excel", type=["xlsx"], key="pickups")
-targets_file = st.sidebar.file_uploader("Upload Targets Excel", type=["xlsx"], key="targets")
+# -----------------------------
+# Init session state
+# -----------------------------
+if "OFFS" not in st.session_state:
+    st.session_state.OFFS = pd.DataFrame(columns=["Name","X","Y","Speed","TS","Type"])
+if "CATTAS" not in st.session_state:
+    st.session_state.CATTAS = pd.DataFrame(columns=["Name","X","Y","Speed","TS","Count","UsesLeft"])
+if "PICKUPS" not in st.session_state:
+    st.session_state.PICKUPS = pd.DataFrame(columns=["Name","X","Y","Speed","TS","Treasury"])
+if "TARGETS" not in st.session_state:
+    st.session_state.TARGETS = pd.DataFrame(columns=["Name","Type","X","Y","Treasury","Distance"])
 
-if all([offs_file, cattas_file, pickups_file, targets_file]):
-    offs = pd.read_excel(offs_file)
-    cattas = pd.read_excel(cattas_file)
-    pickups = pd.read_excel(pickups_file)
-    targets = pd.read_excel(targets_file)
+MAP_SIZE = 401
 
-    st.success("✅ All files uploaded successfully")
+# -----------------------------
+# Helpers
+# -----------------------------
+def wrap_distance(x1, y1, x2, y2, map_size=401):
+    def d(a,b): return min(abs(a-b), map_size-abs(a-b))
+    return math.hypot(d(x1,x2), d(y1,y2))
 
-    if st.button("Create Plan"):
-        plan = assign_offs_and_cattas(targets, offs, cattas, pickups)
+def travel_time(distance, speed, ts_level):
+    if distance <= 20: return distance/speed
+    first = 20/speed
+    rest_speed = speed*(1+0.2*ts_level)
+    rest = (distance-20)/rest_speed
+    return first+rest
 
-        st.subheader("📜 Planned Runs")
-        st.dataframe(plan)
+def fmt_hms(h):
+    if h==float("inf"): return "-"
+    tot = int(round(h*3600))
+    H = tot//3600; M=(tot%3600)//60; S=tot%60
+    return f"{H:02d}:{M:02d}:{S:02d}"
 
-        st.download_button(
-            label="💾 Download Plan as Excel",
-            data=plan.to_csv(index=False).encode("utf-8"),
-            file_name="artefact_plan.csv",
-            mime="text/csv"
-        )
-else:
-    st.info("Please upload all four Excel files to start planning.")
+# -----------------------------
+# Parse artefact overview text
+# -----------------------------
+COORD_RE = re.compile(r"\((-?\d+)\|(-?\d+)\)")
+def parse_overview(text):
+    rows=[]
+    lines=[l.strip() for l in text.split("\n") if l.strip()]
+    for i,line in enumerate(lines):
+        if "Schatzkammer" in line or "treasure" in line.lower():
+            name=lines[i-1]
+            tre=None
+            m=re.search(r"(\d+)", line)
+            if m: tre=int(m.group(1))
+            m2=COORD_RE.search("\n".join(lines[i:i+30]))
+            x=y=None
+            if m2: x=int(m2.group(1)); y=int(m2.group(2))
+            rows.append(dict(Name=name,Type=name,X=x,Y=y,Treasury=tre))
+    return pd.DataFrame(rows)
+
+# -----------------------------
+# Priority logic
+# -----------------------------
+def arti_priority(name, typ):
+    n=(name or "").lower()
+    if "unique" in n or "einzig" in n: return 1
+    if "trainer" in n or "ausbilder" in n: return 2
+    if "diet" in n or "getreide" in n: return 3
+    if "boots" in n or "stiefel" in n: return 4
+    if "eyes" in n or "auge" in n or "scout" in n: return 5
+    if "plan" in n or "lager" in n or "granary" in n: return 6
+    return 7
+
+# -----------------------------
+# Planner
+# -----------------------------
+def plan_targets(targets, offs, cattas, pickups):
+    offs = offs.copy()
+    offs["_used"] = False
+    cattas = cattas.copy()
+    if "UsesLeft" not in cattas.columns: cattas["UsesLeft"] = 2
+    pickups = pickups.copy()
+    pickups["_used"] = False
+
+    targets = targets.copy()
+    targets["priority"] = targets.apply(lambda r: arti_priority(r["Name"], r["Type"]), axis=1)
+    targets = targets.sort_values("priority").reset_index(drop=True)
+
+    planned = []
+    unplanned = []
+
+    for _, t in targets.iterrows():
+        tx, ty = t["X"], t["Y"]
+
+        # find OFF
+        best_off = None; best_off_time=float("inf")
+        for i,o in offs.iterrows():
+            if o["_used"]: continue
+            dist=wrap_distance(o["X"],o["Y"],tx,ty,MAP_SIZE)
+            ttime=travel_time(dist,o["Speed"],o["TS"])
+            if ttime<best_off_time:
+                best_off_time=ttime; best_off=(i,o)
+        if best_off is None:
+            unplanned.append({"Artefact":t["Name"],"Reason":"No free OFF"})
+            continue
+
+        # find CATTAS
+        best_catta = None; best_catta_time=float("inf")
+        for i,c in cattas.iterrows():
+            if c["UsesLeft"]<=0: continue
+            dist=wrap_distance(c["X"],c["Y"],tx,ty,MAP_SIZE)
+            ttime=travel_time(dist,c["Speed"],c["TS"])
+            if ttime<best_catta_time:
+                best_catta_time=ttime; best_catta=(i,c)
+        if best_catta is None:
+            unplanned.append({"Artefact":t["Name"],"Reason":"No free CATTAS"})
+            continue
+
+        # find PICKUP
+        best_pick = None; best_pick_time=float("inf")
+        for i,p in pickups.iterrows():
+            if p["_used"]: continue
+            dist=wrap_distance(p["X"],p["Y"],tx,ty,MAP_SIZE)
+            ttime=travel_time(dist,p["Speed"],p["TS"])
+            if ttime<best_pick_time:
+                best_pick_time=ttime; best_pick=(i,p)
+        if best_pick is None:
+            unplanned.append({"Artefact":t["Name"],"Reason":"No free Pickup"})
+            continue
+
+        # reserve
+        offs.at[best_off[0],"_used"]=True
+        cattas.at[best_catta[0],"UsesLeft"] -=1
+        pickups.at[best_pick[0],"_used"]=True
+
+        # record
+        planned.append({
+            "Artefact":t["Name"],
+            "Off":best_off[1]["Name"], "Off ETA":fmt_hms(best_off_time),
+            "Cattas":best_catta[1]["Name"], "Catta ETA":fmt_hms(best_catta_time),
+            "Pickup":best_pick[1]["Name"], "Pickup ETA":fmt_hms(best_pick_time),
+            "Arrival":fmt_hms(max(best_off_time,best_catta_time,best_pick_time))
+        })
+    return pd.DataFrame(planned), pd.DataFrame(unplanned)
+
+# -----------------------------
+# Tabs
+# -----------------------------
+tab1, tab2, tab3, tab4, tab5 = st.tabs(["Offs","Cattas","Pickups","Targets","Planner"])
+
+with tab1:
+    st.subheader("⚔️ Manage Offs")
+    st.session_state.OFFS = st.data_editor(st.session_state.OFFS, num_rows="dynamic")
+
+with tab2:
+    st.subheader("🏹 Manage Cattas (each row max 2x)")
+    if "UsesLeft" not in st.session_state.CATTAS.columns:
+        st.session_state.CATTAS["UsesLeft"]=2
+    st.session_state.CATTAS = st.data_editor(st.session_state.CATTAS, num_rows="dynamic")
+
+with tab3:
+    st.subheader("🏛 Manage Pickups (Treasuries)")
+    st.session_state.PICKUPS = st.data_editor(st.session_state.PICKUPS, num_rows="dynamic")
+
+with tab4:
+    st.subheader("📜 Paste Artefact Overview")
+    text = st.text_area("Paste Travian artefact overview text/HTML here")
+    if st.button("Parse Overview"):
+        df = parse_overview(text)
+        st.session_state.TARGETS = df
+        st.success(f"Parsed {len(df)} targets")
+    st.dataframe(st.session_state.TARGETS)
+
+with tab5:
+    st.subheader("🗺 Planner")
+    if st.session_state.TARGETS.empty:
+        st.info("Paste artefacts first.")
+    elif st.session_state.OFFS.empty or st.session_state.CATTAS.empty or st.session_state.PICKUPS.empty:
+        st.info("Fill Offs, Cattas, and Pickups first.")
+    else:
+        if st.button("Run Planner"):
+            planned, unplanned = plan_targets(
+                st.session_state.TARGETS,
+                st.session_state.OFFS,
+                st.session_state.CATTAS,
+                st.session_state.PICKUPS
+            )
+            st.session_state["PLANNED"]=planned
+            st.session_state["UNPLANNED"]=unplanned
+
+        if "PLANNED" in st.session_state:
+            if not st.session_state["PLANNED"].empty:
+                st.success("Planned Runs")
+                st.dataframe(st.session_state["PLANNED"])
+            if not st.session_state["UNPLANNED"].empty:
+                st.error("Unplanned Artefacts")
+                st.dataframe(st.session_state["UNPLANNED"])
